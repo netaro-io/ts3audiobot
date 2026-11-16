@@ -22,6 +22,42 @@ Dazu: Equal-Power-Rampen statt linearer Interpolation zwischen zwei Lautstärken
 asynchroner Crossfade, ein Shuffle-Bag ohne Seiteneffekte beim Nachfüllen, Opus im
 VBR-Modus und ein behobener `Math.Abs(short.MinValue)`-Überlauf in `PreciseTimedPipe`.
 
+## Stoppen ohne Knacken
+
+`Player.Stop` fadete die Lautstärke auf null und hielt danach sofort den Sendethread an
+(`PreciseTimedPipe.Paused`). Hörbar war das als Knacken, und zwar aus drei Gründen
+gleichzeitig: Opus arbeitet mit Overlap-Add, der letzte Frame lässt sich ohne seinen
+Nachfolger nicht auflösen; der Jitterpuffer des Clients lief ohne Vorwarnung leer, worauf
+dieser den Abriss extrapoliert statt in Stille zu gehen; und der Fade endete im Puffer,
+nicht beim Hörer.
+
+Nach dem Fade läuft jetzt eine kurze Nachlaufphase: ein Producer, der Stille liefert,
+hängt für rund 120 ms in der `MergePipe`, und erst danach wird pausiert und die Quelle
+abgebaut. Die Stille geht bewusst in die `MergePipe` und nicht an die Senke des Players -
+die hängt hinter dem Encoder, dort wären rohe PCM-Nullen ein kaputtes Opus-Paket.
+
+Dass die Quelle erst nach dem Nachlauf abgebaut wird, hat denselben Grund: ffmpeg zu
+beenden, während der Tick-Thread noch liest, war die zweite Hälfte des Problems.
+
+## Cover einzeln abrufbar
+
+Die Avatar-Karte findet Cover schon, gibt aber nur das fertige Bild mit Text und
+Fortschrittsbalken aus. Für eine Oberfläche, die den Titel selbst anzeigt, ist das zu
+viel - gebraucht wird das nackte Cover.
+
+`NowPlayingCard.CoverAsync` liefert es, und der Befehl `data song art get` gibt es als
+JPEG heraus. Beides nutzt denselben Cache und dieselbe Trefferprüfung wie die Karte, damit
+Oberfläche und Clientfenster nicht verschiedene Bilder zeigen.
+
+Nicht zu verwechseln mit dem eingebauten `data song cover get`: das läuft über
+`GetThumbnail` und verlangt einen `IThumbnailResolver` zum jeweiligen `AudioType`. Für
+lokale Dateien und Radiostreams gibt es keinen, der Befehl liefert dort also nichts. Der
+Weg über die Karte arbeitet dagegen mit dem Titelstring und greift auch bei Radio, wo der
+Titel aus den ICY-Metadaten kommt.
+
+Findet keine Quelle ein Cover, kommt der generierte Platzhalter - so bleibt immer ein Bild
+übrig, und der Aufrufer braucht keinen Sonderfall.
+
 ## Avatar-Karte
 
 `TS3AudioBot/NowPlayingCard.cs` (neu) rendert Cover, Titel, Künstler und einen
