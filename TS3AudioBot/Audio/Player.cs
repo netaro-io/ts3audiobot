@@ -148,7 +148,11 @@ public sealed class Player : IDisposable
 		{
 			DetachLive();
 			liveBuffer = new PullBuffer(source);
-			liveGain = new GainProducer(liveBuffer);
+			// Von null hochblenden, nicht auf vollem Pegel einsetzen. Dieser
+			// Zweig tat das bisher nicht, der andere schon - der Einsatz war
+			// deshalb beim ersten Titel hart und danach weich.
+			liveGain = new GainProducer(liveBuffer, 0f);
+			liveGain.RampTo(1f, FadeInHard, false);
 			source.OnSongEnd += TriggerSongEnd;
 			source.OnSongUpdated += TriggerSongUpdated;
 			MergePipe.Add(liveGain);
@@ -272,28 +276,53 @@ public sealed class Player : IDisposable
 		liveGain = null;
 	}
 
-	public async Task Stop()
+	/// <summary>Haelt die Wiedergabe an und kehrt sofort zurueck.
+	///
+	/// Der Ton klingt im Hintergrund aus: Fade, Nachlauf-Stille und Abbau der
+	/// Quelle brauchen zusammen gut zweihundert Millisekunden, und darauf zu
+	/// warten hiess, dass der Aufrufer - und damit das Panel - genauso lange
+	/// haengt. Das war als Verzoegerung beim Druecken zu merken.
+	///
+	/// Die Stille nach dem Fade bleibt der eigentliche Punkt: ohne sie hat der
+	/// letzte Opus-Frame keinen Nachfolger, mit dem der Decoder ihn aufloesen
+	/// kann, und der Jitterpuffer des Clients laeuft ohne Vorwarnung leer - der
+	/// Client extrapoliert dann den Abriss, und genau das knackt.</summary>
+	public Task Stop()
 	{
 		var fading = liveGain;
-		if (fading != null)
+		fading?.RampTo(0f, FadeOutStop, false);
+
+		// Ab hier gilt die Wiedergabe als beendet: ein zweiter Stop findet keine
+		// Quelle mehr und laeuft ins Leere, statt den Ausklang zu verdoppeln.
+		var source = CurrentPlayerSource;
+		if (source is null)
 		{
-			fading.RampTo(0f, FadeOutStop, false);
-			await WaitForRamp(fading, FadeOutStop);
+			DropIncoming(false);
+			DetachLive();
+			if (MergePipe.Count <= 1)
+				TimePipe.Paused = true;
+
+			return Task.CompletedTask;
 		}
-		DropIncoming(false);
-		// Stille nachschieben, bevor der Strom endet. Ohne sie hat der letzte
-		// Opus-Frame keinen Nachfolger, mit dem der Decoder ihn auflösen kann,
-		// und der Jitterpuffer des Clients läuft ohne Vorwarnung leer - der
-		// Client extrapoliert den Abriss, und genau das knackt.
-		//
-		// Die Stille kommt in die MergePipe, nicht an PlayerSink: der hängt
-		// hinter dem Encoder, dort wären PCM-Nullen ein kaputtes Opus-Paket.
-		// Die Quelle wird erst danach abgebaut - ffmpeg zu töten, während der
-		// Tick-Thread noch liest, war die zweite Hälfte desselben Problems.
-		await SendSilenceTail();
-		DetachLive();
-		if (MergePipe.Count <= 1)
-			TimePipe.Paused = true;
+
+		scheduler.InvokeAsync(async () =>
+		{
+			if (fading != null)
+				await WaitForRamp(fading, FadeOutStop);
+
+			DropIncoming(false);
+			// Die Stille geht in die MergePipe, nicht an PlayerSink: der haengt
+			// hinter dem Encoder, dort waeren rohe PCM-Nullen ein kaputtes
+			// Opus-Paket.
+			await SendSilenceTail();
+			// Erst danach abbauen - ffmpeg zu toeten, waehrend der Tick-Thread
+			// noch liest, war die zweite Haelfte desselben Problems.
+			DetachLive();
+			if (MergePipe.Count <= 1)
+				TimePipe.Paused = true;
+		});
+
+		return Task.CompletedTask;
 	}
 
 	/// <summary>Schiebt nach dem Fade echte Stille nach, damit der Paketstrom
