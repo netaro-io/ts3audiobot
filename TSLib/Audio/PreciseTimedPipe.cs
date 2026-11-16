@@ -26,7 +26,17 @@ public sealed class PreciseTimedPipe : IAudioActiveConsumer, IAudioActiveProduce
 	public IAudioPassiveProducer? InStream { get; set; }
 	public IAudioPassiveConsumer? OutStream { get; set; }
 
-	public TimeSpan AudioBufferLength { get; set; } = TimeSpan.FromMilliseconds(300);
+	/// <summary>Vorlauf, den der Bot in den Jitterpuffer der Clients schiebt.
+	///
+	/// Alles, was der Kunde drueckt, wirkt erst, wenn dieser Vorlauf abgespielt
+	/// ist. Bei 300 ms war das Stoppen als Nachlaufen zu hoeren und der Fade gar
+	/// nicht: er ist kuerzer als der Puffer. 60 ms liegen ueber einem Frame
+	/// (20 ms) und unter der Fade-Dauer, womit der Ausklang hoerbar wird.
+	///
+	/// Upstream liefert 20 ms. Die Reserve hier ist fuer den Nachschub von
+	/// ffmpeg, nicht fuer das Netz - gemessen schwankt die Strecke zum
+	/// Sprachserver um Zehntelmillisekunden.</summary>
+	public TimeSpan AudioBufferLength { get; set; } = TimeSpan.FromMilliseconds(60);
 	public TimeSpan SendCheckInterval { get; set; } = TimeSpan.FromMilliseconds(5);
 	public int ReadBufferSize { get; set; } = 960 * 4;
 	private byte[] readBuffer = [];

@@ -94,7 +94,7 @@ public sealed class Player : IDisposable
 		VolumePipe = new VolumePipe();
 		Volume = config.Audio.Volume.Default;
 		EncoderPipe = new EncoderPipe(SendCodec) { Bitrate = ScaleBitrate(config.Audio.Bitrate) };
-		TimePipe = new PreciseTimedPipe(EncoderPipe.SampleInfo, id) { ReadBufferSize = EncoderPipe.PacketSize, AudioBufferLength = TimeSpan.FromMilliseconds(300) };
+		TimePipe = new PreciseTimedPipe(EncoderPipe.SampleInfo, id) { ReadBufferSize = EncoderPipe.PacketSize, AudioBufferLength = TimeSpan.FromMilliseconds(60) };
 		MergePipe = [];
 
 		config.Audio.Bitrate.Changed += (s, e) => EncoderPipe.Bitrate = ScaleBitrate(e.NewValue);
