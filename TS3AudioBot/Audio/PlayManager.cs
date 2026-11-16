@@ -481,6 +481,15 @@ public class PlayManager
 		}
 
 		// Phase 3: nothing armed - resolve the upcoming track ahead of time.
+		//
+		// Not while a live stream is playing. Resolving opens a second connection
+		// to the station, and providers commonly allow only one per listener: the
+		// running track then dies with "Could not load", the player moves on, and
+		// the listener hears the station *after* the one they picked. A stream has
+		// no end to fade into anyway, so there is nothing to prepare here.
+		if (CurrentPlayData?.PlayResource is MediaPlayResource { IsIcyStream: true })
+			return;
+
 		var fromIndex = playlistManager.Index;
 		var peek = playlistManager.PeekNext(false);
 		if (peek?.AudioResource is null)
