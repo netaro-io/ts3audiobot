@@ -466,9 +466,12 @@ internal static partial class NowPlayingCard
 					|| wantedArtist.Contains(gotArtist, StringComparison.Ordinal))
 					return true;
 				// Artist names can differ purely by transliteration - a Japanese name against
-				// its latin spelling, for instance. An exactly equal title is then still a
-				// strong enough signal to accept the hit.
-				return !requireArtist && gotTitle == wantedTitle;
+				// its latin spelling, for instance. Accept that only in the strict pass, where
+				// the artist was part of the query and the provider did the mapping itself, and
+				// only when the two names really are written in different scripts. Without both
+				// guards a title-only search hands the cover of any stranger with a song of the
+				// same name - U2's "Zooropa" for the Japanese "Lemon", Kollegah for "Magnum Opus".
+				return requireArtist && gotTitle == wantedTitle && DifferentScripts(wantedArtist, gotArtist);
 			}
 			if (requireArtist)
 				return false;
@@ -477,6 +480,25 @@ internal static partial class NowPlayingCard
 		// No artist to check against: only accept an exact title, otherwise the risk of
 		// attaching a stranger's artwork is too high.
 		return gotTitle == wantedTitle;
+	}
+
+	/// <summary>
+	/// True when the two names are written in different writing systems, which is the only
+	/// case where a mismatching artist name may still describe the same person. A latin
+	/// spelling against another latin spelling is simply a different artist.
+	/// </summary>
+	private static bool DifferentScripts(string left, string right)
+		=> IsLatin(left) != IsLatin(right);
+
+	private static bool IsLatin(string value)
+	{
+		foreach (var character in value)
+		{
+			// Digits carry no script, so they must not decide the answer either way.
+			if (char.IsLetter(character) && character > 0x024F)
+				return false;
+		}
+		return true;
 	}
 
 	/// <summary>Exact match, or containment with enough shared length that it cannot be
