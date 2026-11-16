@@ -19,6 +19,7 @@ using TS3AudioBot.Localization;
 using TS3AudioBot.Playlists;
 using TS3AudioBot.ResourceFactories;
 using TSLib.Helper;
+using TSLib.Scheduler;
 
 namespace TS3AudioBot.Audio;
 
@@ -27,11 +28,31 @@ public class PlayManager
 {
 	private static readonly NLog.Logger Log = NLog.LogManager.GetCurrentClassLogger();
 
+	/// <summary>Tick interval of the crossfade state machine.</summary>
+	private static readonly TimeSpan TickInterval = TimeSpan.FromMilliseconds(100);
+	/// <summary>Overlap used for a manual skip - short, because the user expects it to react.</summary>
+	private static readonly TimeSpan ManualSkipFade = TimeSpan.FromMilliseconds(1200);
+	/// <summary>Upper bound for the configurable crossfade length, in seconds.</summary>
+	private const int MaxCrossfadeSeconds = 20;
+	/// <summary>Tracks shorter than this never crossfade - it would eat most of the song.</summary>
+	private static readonly TimeSpan MinTrackForFade = TimeSpan.FromSeconds(8);
+	/// <summary>How long a manual skip waits for a prefetch that is still resolving.</summary>
+	private const int PrefetchWaitMs = 1500;
+
 	private readonly ConfBot confBot;
 	private readonly Player playerConnection;
 	private readonly PlaylistManager playlistManager;
 	private readonly ResolveContext resourceResolver;
 	private readonly Stats stats;
+	private readonly DedicatedTaskScheduler scheduler;
+	private TickWorker? crossfadeTicker;
+	private bool tickerRequested;
+	private bool crossfadeBusy;
+	private int crossfadeGeneration;
+	private CrossfadePhase crossfadePhase;
+	private PlaylistItem? armedItem;
+	private PlayResource? armedResource;
+	private int armedFromIndex;
 
 	public PlayInfoEventArgs? CurrentPlayData { get; private set; }
 	public bool IsPlaying => CurrentPlayData != null;
@@ -43,13 +64,14 @@ public class PlayManager
 	public event AsyncEventHandler<SongEndEventArgs>? ResourceStopped;
 	public event AsyncEventHandler? PlaybackStopped;
 
-	public PlayManager(ConfBot config, Player playerConnection, PlaylistManager playlistManager, ResolveContext resourceResolver, Stats stats)
+	public PlayManager(ConfBot config, Player playerConnection, PlaylistManager playlistManager, ResolveContext resourceResolver, Stats stats, DedicatedTaskScheduler scheduler)
 	{
 		confBot = config;
 		this.playerConnection = playerConnection;
 		this.playlistManager = playlistManager;
 		this.resourceResolver = resourceResolver;
 		this.stats = stats;
+		this.scheduler = scheduler;
 	}
 
 	public Task Enqueue(InvokerData invoker, AudioResource ar, PlayInfo? meta = null) => Enqueue(invoker, new PlaylistItem(ar, meta));
@@ -226,10 +248,20 @@ public class PlayManager
 		playerConnection.Volume = Math.Clamp(playerConnection.Volume, confBot.Audio.Volume.Min, confBot.Audio.Volume.Max);
 		CurrentPlayData = playInfo; // TODO meta as readonly
 		await AfterResourceStarted.InvokeAsync(this, playInfo);
+		EnsureCrossfadeTicker();
 	}
 
 	public async Task Next(InvokerData invoker, bool manually = true)
 	{
+		// A skip during a running fade: finish it instantly rather than layering a third track.
+		if (playerConnection.CrossfadeActive)
+		{
+			playerConnection.CompleteCrossfade(true);
+			ClearArmed();
+		}
+		if (await TryUsePrefetch(invoker, manually))
+			return;
+		CancelCrossfade();
 		PlaylistItem? pli = null;
 		for (int i = 0; i < 10; i++)
 		{
@@ -250,6 +282,7 @@ public class PlayManager
 
 	public async Task Previous(InvokerData invoker, bool manually = true)
 	{
+		CancelCrossfade();
 		PlaylistItem? pli = null;
 		for (int i = 0; i < 10; i++)
 		{
@@ -268,9 +301,26 @@ public class PlayManager
 			throw Error.LocalStr(string.Format(strings.error_playmgr_many_songs_failed, "!previous"));
 	}
 
-	public async Task SongStoppedEvent(object? sender, EventArgs e) => await StopInternal(true);
+	public async Task SongStoppedEvent(object? sender, EventArgs e)
+	{
+		// The outgoing decoder reached its end while the fade was still running - the incoming
+		// track is already live, so this is not a queue end.
+		if (playerConnection.CrossfadeActive)
+		{
+			playerConnection.CompleteCrossfade(false);
+			ClearArmed();
+			return;
+		}
+		if (playerConnection.TakeSuppressedEnd())
+			return;
+		await StopInternal(true);
+	}
 
-	public Task Stop() => StopInternal(false);
+	public Task Stop()
+	{
+		CancelCrossfade();
+		return StopInternal(false);
+	}
 
 	private async Task StopInternal(bool songEndedByCallback)
 	{
@@ -287,7 +337,7 @@ public class PlayManager
 		}
 		else
 		{
-			playerConnection.Stop();
+			await playerConnection.Stop();
 		}
 
 		CurrentPlayData = null;
@@ -326,6 +376,231 @@ public class PlayManager
 			}
 		}
 		return meta;
+	}
+
+	private void EnsureCrossfadeTicker()
+	{
+		if (tickerRequested)
+			return;
+		tickerRequested = true;
+		_ = scheduler.InvokeAsync(() =>
+		{
+			crossfadeTicker ??= scheduler.CreateTimer(() => { _ = OnCrossfadeTick(); }, TickInterval, true);
+			return Task.CompletedTask;
+		});
+	}
+
+	private async Task OnCrossfadeTick()
+	{
+		if (crossfadeBusy)
+			return;
+		crossfadeBusy = true;
+		try
+		{
+			await StepCrossfade();
+		}
+		catch (OperationCanceledException)
+		{
+		}
+		catch (AudioBotException ex)
+		{
+			Log.Debug("Crossfade skipped: {0}", ex.Message);
+			ClearArmed();
+		}
+		catch (Exception ex)
+		{
+			// The ticker must survive anything: if it dies, playback stops advancing silently.
+			Log.Warn(ex, "Unexpected error in the crossfade tick");
+			ClearArmed();
+		}
+		finally
+		{
+			crossfadeBusy = false;
+		}
+	}
+
+	private async Task StepCrossfade()
+	{
+		if (!IsPlaying)
+			return;
+
+		// Phase 1: a fade is running - keep feeding it and close it out once the ramp finished.
+		if (playerConnection.CrossfadeActive)
+		{
+			playerConnection.PumpCrossfade();
+			if (playerConnection.CrossfadeSettled)
+			{
+				playerConnection.CompleteCrossfade(true);
+				ClearArmed();
+			}
+			return;
+		}
+
+		if (crossfadePhase is CrossfadePhase.Loading or CrossfadePhase.Starting)
+			return;
+
+		// Phase 2: next track is decoded and waiting - start the fade when the tail is reached.
+		if (crossfadePhase == CrossfadePhase.Ready && armedResource is not null && armedItem is not null)
+		{
+			if (playlistManager.Index != armedFromIndex)
+			{
+				ClearArmed();
+			}
+			else
+			{
+				var fade = FadeLength();
+				var length = playerConnection.Length;
+				var position = playerConnection.Position;
+				if (fade <= TimeSpan.Zero || length is null || position is null || length.Value - position.Value > fade)
+					return;
+
+				var moved = playlistManager.Next(false);
+				if (moved?.AudioResource?.ResourceId != armedItem.AudioResource.ResourceId)
+				{
+					ClearArmed();
+					return;
+				}
+
+				// Hold the phase across the await so a second tick cannot start a second fade.
+				crossfadePhase = CrossfadePhase.Starting;
+				var starting = armedResource;
+				try
+				{
+					await playerConnection.BeginCrossfade(starting.PlayUri, starting.PlayInfo?.StartOffset, fade);
+				}
+				catch (Exception ex)
+				{
+					Log.Warn(ex, "Could not start crossfade, falling back to a direct cut");
+					ClearArmed();
+					return;
+				}
+				ClearArmed();
+				await Announce(starting, CurrentPlayData?.Invoker ?? InvokerData.Anonymous);
+				return;
+			}
+		}
+
+		// Phase 3: nothing armed - resolve the upcoming track ahead of time.
+		var fromIndex = playlistManager.Index;
+		var peek = playlistManager.PeekNext(false);
+		if (peek?.AudioResource is null)
+			return;
+		crossfadePhase = CrossfadePhase.Loading;
+		var generation = ++crossfadeGeneration;
+		PlayResource loaded;
+		try
+		{
+			loaded = await WithPlayRequestCancelToken(ct => resourceResolver.Load(peek.AudioResource, ct));
+		}
+		catch
+		{
+			if (generation == crossfadeGeneration)
+				crossfadePhase = CrossfadePhase.Idle;
+			return;
+		}
+		if (generation != crossfadeGeneration || playlistManager.Index != fromIndex)
+		{
+			if (generation == crossfadeGeneration)
+				crossfadePhase = CrossfadePhase.Idle;
+			return;
+		}
+		armedItem = peek;
+		armedResource = loaded;
+		armedFromIndex = fromIndex;
+		crossfadePhase = CrossfadePhase.Ready;
+	}
+
+	private void ClearArmed()
+	{
+		crossfadePhase = CrossfadePhase.Idle;
+		armedResource = null;
+		armedItem = null;
+	}
+
+	/// <summary>Overlap for an automatic track change, capped so that a short track cannot be
+	/// swallowed by its own fade.</summary>
+	private TimeSpan FadeLength()
+	{
+		var seconds = Math.Clamp(confBot.Audio.Crossfade.Value, 0, MaxCrossfadeSeconds);
+		var length = playerConnection.Length;
+		if (seconds <= 0 || length is null || length.Value < MinTrackForFade)
+			return TimeSpan.Zero;
+		var fade = TimeSpan.FromSeconds(seconds);
+		// Never spend more than 45 percent of the track on the fade.
+		var ceiling = TimeSpan.FromSeconds(length.Value.TotalSeconds * 0.45);
+		return fade > ceiling ? ceiling : fade;
+	}
+
+	private async Task Announce(PlayResource play, InvokerData invoker)
+	{
+		var sourceLink = resourceResolver.RestoreLink(play.AudioResource);
+		var playInfo = new PlayInfoEventArgs(invoker, play, sourceLink);
+		await BeforeResourceStarted.InvokeAsync(this, playInfo);
+		CurrentPlayData = playInfo;
+		await AfterResourceStarted.InvokeAsync(this, playInfo);
+	}
+
+	/// <summary>Uses the already decoded next track for a manual skip, so <c>!next</c> overlaps
+	/// instead of cutting. Returns false when nothing usable is armed and the caller should
+	/// fall back to a normal start.</summary>
+	private async Task<bool> TryUsePrefetch(InvokerData invoker, bool manually)
+	{
+		// Wait briefly if a prefetch is still resolving - a skip right after a track change
+		// would otherwise always miss it. Bounded so a dead resolver cannot hang the command.
+		if (crossfadePhase == CrossfadePhase.Loading)
+		{
+			var deadline = System.Environment.TickCount64 + PrefetchWaitMs;
+			while (crossfadePhase == CrossfadePhase.Loading && System.Environment.TickCount64 < deadline)
+				await Task.Delay(25);
+		}
+		if (crossfadePhase != CrossfadePhase.Ready || armedResource is null || armedItem?.AudioResource is null)
+			return false;
+		if (playlistManager.Index != armedFromIndex)
+			return false;
+		var peek = playlistManager.PeekNext(manually);
+		if (peek?.AudioResource?.ResourceId != armedItem.AudioResource.ResourceId)
+			return false;
+
+		var play = armedResource;
+		var item = armedItem;
+		crossfadePhase = CrossfadePhase.Starting;
+		playlistManager.Next(manually);
+		try
+		{
+			await playerConnection.BeginCrossfade(play.PlayUri, play.PlayInfo?.StartOffset, ManualSkipFade);
+		}
+		catch (Exception ex)
+		{
+			// The index already advanced, so starting the track directly here keeps the queue
+			// honest. Returning false would make the caller skip one song.
+			Log.Warn(ex, "Prefetched skip failed, starting the track directly");
+			ClearArmed();
+			await StartResource(invoker, item);
+			return true;
+		}
+		ClearArmed();
+		await Announce(play, invoker);
+		return true;
+	}
+
+	/// <summary>Invalidates any pending prefetch and drops a prepared incoming track.
+	/// Bumping the generation makes an in-flight resolve discard its own result.</summary>
+	private void CancelCrossfade()
+	{
+		crossfadeGeneration++;
+		ClearArmed();
+		playerConnection.DropIncoming();
+	}
+
+	private enum CrossfadePhase
+	{
+		Idle,
+		/// <summary>Resolving the next track (network, metadata).</summary>
+		Loading,
+		/// <summary>Next track resolved, waiting for the tail of the current one.</summary>
+		Ready,
+		/// <summary>Spawning the decoder for the fade; blocks a second concurrent start.</summary>
+		Starting,
 	}
 
 	private async Task<T> WithPlayRequestCancelToken<T>(Func<CancellationToken, Task<T>> request)

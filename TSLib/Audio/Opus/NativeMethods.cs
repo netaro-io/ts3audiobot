@@ -89,12 +89,30 @@ public static class NativeMethods
 
 public enum Ctl : int
 {
+	SetComplexityRequest = 4010,
+	GetComplexityRequest = 4011,
 	SetBitrateRequest = 4002,
 	GetBitrateRequest = 4003,
+	SetVbrRequest = 4006,
+	GetVbrRequest = 4007,
+	SetVbrConstraintRequest = 4020,
+	GetVbrConstraintRequest = 4021,
+	SetSignalRequest = 4024,
+	GetSignalRequest = 4025,
 	SetInbandFecRequest = 4012,
 	GetInbandFecRequest = 4013,
 	SetPacketLossPercentageRequest = 4014,
 	GetPacketLossPercentageRequest = 4015,
+	SetLsbDepthRequest = 4036,
+	GetLsbDepthRequest = 4037,
+}
+
+/// <summary>Hints the encoder at the kind of content, so it can pick its internal mode.</summary>
+public enum OpusSignal : int
+{
+	Auto = -1000,
+	Voice = 3001,
+	Music = 3002,
 }
 
 /// <summary>

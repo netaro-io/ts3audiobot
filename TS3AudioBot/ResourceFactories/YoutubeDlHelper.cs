@@ -215,20 +215,45 @@ public static class YoutubeDlHelper
 			return null;
 
 		JsonYtdlFormat? best = null;
+		JsonYtdlFormat? bestHls = null;
 		foreach (var format in formats)
 		{
 			if (format.acodec == "none")
 				continue;
-			if (best == null
-				|| format.abr > best.abr
-				|| (format.vcodec == "none" && format.abr >= best.abr))
+			if (IsHls(format))
 			{
-				best = format;
+				if (BetterAudio(format, bestHls))
+					bestHls = format;
+				continue;
 			}
+			if (BetterAudio(format, best))
+				best = format;
 		}
 
+		best ??= bestHls;
 		Log.Debug("Picked: {@format}", best);
 		return best;
+	}
+
+	private static bool IsHls(JsonYtdlFormat format)
+	{
+		var url = format.url ?? "";
+		var ext = format.ext ?? "";
+		return ext.Contains("m3u8", StringComparison.OrdinalIgnoreCase)
+			|| url.Contains("m3u8", StringComparison.OrdinalIgnoreCase)
+			|| url.Contains("/hls", StringComparison.OrdinalIgnoreCase)
+			|| url.Contains("manifest", StringComparison.OrdinalIgnoreCase);
+	}
+
+	private static bool BetterAudio(JsonYtdlFormat format, JsonYtdlFormat? best)
+	{
+		if (best is null)
+			return true;
+		var audioOnly = format.vcodec == "none";
+		var bestAudioOnly = best.vcodec == "none";
+		if (audioOnly != bestAudioOnly)
+			return audioOnly;
+		return (format.abr ?? 0) > (best.abr ?? 0);
 	}
 
 	public static SongInfo MapToSongInfo(JsonYtdlDump dump)

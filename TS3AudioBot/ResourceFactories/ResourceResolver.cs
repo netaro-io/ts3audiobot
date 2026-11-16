@@ -99,6 +99,10 @@ public sealed class ResourceResolver : IDisposable
 		{
 			throw CouldNotLoad(ex.Message);
 		}
+		catch (OperationCanceledException)
+		{
+			throw;
+		}
 		catch (Exception ex)
 		{
 			Log.Error(ex, "Resource resolver '{0}' threw while trying to resolve '{@resource}'", resolver.ResolverFor, resource);

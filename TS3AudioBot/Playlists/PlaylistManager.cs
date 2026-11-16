@@ -25,6 +25,8 @@ public sealed class PlaylistManager
 	private const string mixName = ".mix";
 	private readonly Playlist mixList = new() { Title = "Now Playing" };
 	private readonly Lock listLock = new();
+	private readonly List<int> shuffleBag = [];
+	private int shuffleBagCount = -1;
 	public IReadOnlyPlaylist CurrentList => mixList;
 
 	private IShuffleAlgorithm shuffle;
@@ -49,6 +51,7 @@ public sealed class PlaylistManager
 			else
 				shuffle = NormalOrder;
 			shuffle.Index = index;
+			InvalidateShuffleBag();
 		}
 	}
 
@@ -65,9 +68,12 @@ public sealed class PlaylistManager
 
 	public PlaylistItem? Next(bool manually = true) => MoveIndex(forward: true, manually);
 
+	public PlaylistItem? PeekNext(bool manually = false) => MoveIndex(true, manually, false);
+
+
 	public PlaylistItem? Previous(bool manually = true) => MoveIndex(forward: false, manually);
 
-	internal PlaylistItem? MoveIndex(bool? forward, bool manually)
+	internal PlaylistItem? MoveIndex(bool? forward, bool manually, bool consume = true)
 	{
 		lock (listLock)
 		{
@@ -83,6 +89,43 @@ public sealed class PlaylistManager
 			// mode and instead move the index.
 			if ((Loop == LoopMode.One && !manually) || forward is null)
 				return mixList[shuffle.Index];
+
+			if (!consume && forward == true && !random)
+			{
+				if (Loop == LoopMode.Off && !manually && shuffle.Index == mixList.Items.Count - 1)
+					return null;
+				var peeked = (shuffle.Index + 1) % mixList.Items.Count;
+				return mixList[peeked];
+			}
+
+			if (random && forward == true)
+			{
+				// Shuffle bag: every track plays exactly once per pass, then the bag is
+				// reshuffled. That is what listeners expect from "random" - a plain RNG repeats
+				// and starves tracks.
+				if (shuffleBagCount != mixList.Items.Count)
+					RefillShuffleBag();
+
+				if (shuffleBag.Count == 0)
+				{
+					// Pass complete. Without looping this is the end of the queue, and a peek
+					// must not refill the bag - that is a side effect the caller does not expect.
+					if (Loop == LoopMode.Off && !manually)
+						return null;
+					if (!consume)
+						return PeekFreshBagItem();
+					RefillShuffleBag();
+					if (shuffleBag.Count == 0)
+						return mixList[shuffle.Index];
+				}
+
+				var nextIndex = shuffleBag[^1];
+				if (!consume)
+					return mixList[nextIndex];
+				shuffleBag.RemoveAt(shuffleBag.Count - 1);
+				shuffle.Index = nextIndex;
+				return mixList[nextIndex];
+			}
 
 			bool listEnded;
 			if (forward == true)
@@ -106,17 +149,59 @@ public sealed class PlaylistManager
 	}
 
 	public void Queue(PlaylistItem item)
-		=> ModifyPlaylist(mixName, mix => mix.Add(item).UnwrapThrow());
+		=> ModifyPlaylist(mixName, mix => { mix.Add(item).UnwrapThrow(); InvalidateShuffleBag(); });
 
 	public void Queue(IEnumerable<PlaylistItem> items)
-		=> ModifyPlaylist(mixName, mix => mix.AddRange(items).UnwrapThrow());
+		=> ModifyPlaylist(mixName, mix => { mix.AddRange(items).UnwrapThrow(); InvalidateShuffleBag(); });
 
 	public void Clear()
-		=> ModifyPlaylist(mixName, mix => mix.Clear());
+		=> ModifyPlaylist(mixName, mix => { mix.Clear(); InvalidateShuffleBag(); });
+
+	/// <summary>Forces a reshuffle on the next draw. Bag entries are positions, so any change to
+	/// the queue makes them point at different tracks.</summary>
+	private void InvalidateShuffleBag()
+	{
+		shuffleBag.Clear();
+		shuffleBagCount = -1;
+	}
 
 	private void SetRandomSeed()
 	{
 		shuffle.Seed = System.Random.Shared.Next();
+	}
+
+	/// <summary>Refills the bag with every index except the one playing right now, in a
+	/// uniformly shuffled order (Fisher-Yates). Items are taken from the end, so removing one
+	/// never shifts the rest.</summary>
+	private void RefillShuffleBag()
+	{
+		shuffleBag.Clear();
+		shuffleBagCount = mixList.Items.Count;
+		for (var i = 0; i < mixList.Items.Count; i++)
+		{
+			if (i != shuffle.Index)
+				shuffleBag.Add(i);
+		}
+		for (var i = shuffleBag.Count - 1; i > 0; i--)
+		{
+			var swap = System.Random.Shared.Next(i + 1);
+			(shuffleBag[i], shuffleBag[swap]) = (shuffleBag[swap], shuffleBag[i]);
+		}
+	}
+
+	/// <summary>Which track a fresh bag would yield, without actually creating one.
+	/// Lets the prefetch look past the end of a pass while looping, side-effect free.</summary>
+	private PlaylistItem? PeekFreshBagItem()
+	{
+		var count = mixList.Items.Count;
+		if (count == 0)
+			return null;
+		if (count == 1)
+			return mixList[shuffle.Index];
+		var candidate = System.Random.Shared.Next(count - 1);
+		if (candidate >= shuffle.Index)
+			candidate++;
+		return mixList[candidate];
 	}
 
 	public R<IReadOnlyPlaylist, LocalStr> LoadPlaylist(string listId)

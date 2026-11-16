@@ -459,6 +459,9 @@ public sealed class Ts3Client
 
 	public Task DeleteAvatar() => ts3FullClient.DeleteAvatar().UnwrapThrow();
 
+	public Task RequestTalkPower(string message)
+		=> ts3FullClient.RequestTalkPower(message).UnwrapThrow();
+
 	public Task MoveTo(ChannelId channelId, string? password = null)
 		=> ts3FullClient.ClientMove(ts3FullClient.ClientId, channelId, password).UnwrapThrow(_ => (strings.error_ts_cannot_move, true));
 

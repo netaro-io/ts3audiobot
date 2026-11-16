@@ -131,9 +131,41 @@ public sealed class OpusEncoder : IDisposable
 	/// </summary>
 	public Application Application { get; }
 
+	private void Apply(Ctl request, int value)
+	{
+		if (disposed)
+			throw new ObjectDisposedException(nameof(OpusEncoder));
+		var ret = NativeMethods.opus_encoder_ctl(encoder, request, value);
+		if (ret < 0)
+			throw new Exception("Encoder error - " + ((Errors)ret).ToString());
+	}
+
+	/// <summary>Pins the bitrate. Only useful when a fixed packet size matters more than
+	/// quality - for music prefer <see cref="ConfigureForMusic"/>.</summary>
+	public void SetConstantBitrate()
+	{
+		Apply(Ctl.SetVbrRequest, 0);
+		Apply(Ctl.SetVbrConstraintRequest, 0);
+	}
+
 	/// <summary>
-	/// Gets or sets the bitrate setting of the encoding.
+	/// Tunes the encoder for music: unconstrained VBR so dense passages may borrow bits from
+	/// quiet ones, maximum analysis complexity, and the music signal hint. CBR at the same
+	/// nominal rate wastes bits in silence and runs short exactly where it matters.
 	/// </summary>
+	public void ConfigureForMusic()
+	{
+		Apply(Ctl.SetVbrRequest, 1);
+		Apply(Ctl.SetVbrConstraintRequest, 0);
+		Apply(Ctl.SetComplexityRequest, 10);
+		Apply(Ctl.SetSignalRequest, (int)OpusSignal.Music);
+		// Source is 16 bit PCM; telling the encoder stops it from preserving noise below that.
+		Apply(Ctl.SetLsbDepthRequest, 16);
+		// Music has no use for in-band FEC, and it costs bitrate on every packet.
+		Apply(Ctl.SetInbandFecRequest, 0);
+		Apply(Ctl.SetPacketLossPercentageRequest, 0);
+	}
+
 	public int Bitrate
 	{
 		get

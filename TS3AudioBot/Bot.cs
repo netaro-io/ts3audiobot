@@ -39,9 +39,22 @@ public sealed class Bot
 {
 	private static readonly NLog.Logger Log = NLog.LogManager.GetCurrentClassLogger();
 
+	/// <summary>How often the elapsed time in the client description is refreshed.</summary>
+	private static readonly TimeSpan DescriptionTickInterval = TimeSpan.FromSeconds(5);
+	/// <summary>Minimum gap between two avatar uploads while a track plays. An upload is a file
+	/// transfer plus a broadcast to every client, so this stays well above the tick rate.</summary>
+	private const long AvatarRefreshIntervalMs = 20_000;
+	/// <summary>Granularity of the progress bar: the avatar is only redrawn when the bar would
+	/// advance by at least one step, which keeps short tracks from uploading needlessly.</summary>
+	private const int ProgressSteps = 20;
+
 	private readonly ConfBot config;
 	private readonly TickWorker idleTickWorker;
 	private CancellationTokenSource? avatarRequest;
+	private TickWorker? descriptionTicker;
+	private string? lastDescription;
+	private long lastAvatarRefresh;
+	private int lastProgressStep = -1;
 
 	private bool isClosed;
 	internal BotInjector Injector { get; }
@@ -163,8 +176,17 @@ public sealed class Bot
 				return Task.CompletedTask;
 			};
 		// Update our thumbnail
-		playManager.AfterResourceStarted += (s, e) => GenerateStatusImage(true, e);
-		playManager.PlaybackStopped += (s, e) => GenerateStatusImage(false, null);
+		playManager.AfterResourceStarted += (s, e) =>
+		{
+			// The new track starts its progress bar from scratch.
+			ResetAvatarRefresh();
+			return GenerateStatusImage(true, e);
+		};
+		playManager.PlaybackStopped += (s, e) =>
+		{
+			ResetAvatarRefresh();
+			return GenerateStatusImage(false, null);
+		};
 		// Stats
 		playManager.AfterResourceStarted += (s, e) =>
 		{
@@ -229,9 +251,16 @@ public sealed class Bot
 		Log.Info("Bot ({0}) disconnecting.", Id);
 
 		DisableIdleTickWorker();
+		DisableDescriptionTicker();
 
 		Injector.GetModule<PluginManager>()?.StopPlugins(this);
-		Injector.GetModule<PlayManager>()?.Stop();
+		var playManagerModule = Injector.GetModule<PlayManager>();
+		if (playManagerModule != null)
+		{
+			// Awaited so playback has actually faded out before the player is disposed.
+			try { await playManagerModule.Stop(); }
+			catch (Exception ex) { Log.Debug(ex, "Stopping playback during shutdown failed"); }
+		}
 		Injector.GetModule<Player>()?.Dispose();
 		var tsClient = Injector.GetModule<Ts3Client>();
 		if (tsClient != null)
@@ -247,6 +276,12 @@ public sealed class Bot
 		var badges = config.Connect.Badges.Value;
 		if (!string.IsNullOrEmpty(badges))
 			ts3client?.ChangeBadges(badges);
+
+		if (ts3client != null)
+		{
+			try { await ts3client.RequestTalkPower("Hostleaf Radio"); }
+			catch (Exception ex) { Log.Debug(ex, "Talk power request failed"); }
+		}
 
 		var onStart = config.Events.OnConnect.Value;
 		if (!string.IsNullOrEmpty(onStart))
@@ -425,20 +460,83 @@ public sealed class Bot
 		if (!config.SetStatusDescription)
 			return;
 
-		string? setString;
-		if (playManager.IsPlaying)
-		{
-			setString = QuizMode
-				? strings.info_botstatus_quiztime
-				: playManager.CurrentPlayData?.ResourceData?.ResourceTitle;
-		}
-		else
-		{
-			setString = strings.info_botstatus_sleeping;
-		}
+		var playing = playManager.IsPlaying && !QuizMode;
+		var rawTitle = QuizMode
+			? strings.info_botstatus_quiztime
+			: playManager.CurrentPlayData?.ResourceData?.ResourceTitle;
+
+		// Quiz mode hides the track, so it must not leak the elapsed time either.
+		var player = QuizMode ? null : Injector.GetModule<Player>();
+		var setString = NowPlayingCard.Description(rawTitle, playing, player?.Position, player?.Length);
+
+		// The server rejects a description identical to the current one, and the time ticks
+		// every second - skipping no-ops keeps that off the wire.
+		if (string.Equals(setString, lastDescription, StringComparison.Ordinal))
+			return;
+		lastDescription = setString;
 
 		var result = await ts3FullClient.ChangeDescription(setString ?? "");
 		result.UnwrapToLog(Log);
+
+		// Only tick while something is playing - idle there is nothing to count up.
+		if (playing)
+			EnsureDescriptionTicker();
+		else
+			DisableDescriptionTicker();
+	}
+
+	/// <summary>Fraction of the track that has played, for the strip on the avatar.
+	/// Null when there is nothing to show: not playing, quiz mode, or unknown length (live stream).
+	/// The avatar is only redrawn on a track change, so this is the position at that moment.</summary>
+	private double? AvatarProgress(bool playing)
+	{
+		if (!playing || QuizMode)
+			return null;
+		var player = Injector.GetModule<Player>();
+		var length = player?.Length;
+		var position = player?.Position;
+		if (length is null || position is null || length.Value <= TimeSpan.Zero)
+			return null;
+		return Math.Clamp(position.Value.TotalSeconds / length.Value.TotalSeconds, 0d, 1d);
+	}
+
+	/// <summary>Keeps the elapsed time in the description moving while a track plays.
+	/// Started lazily and only when a description is actually shown.</summary>
+	private void EnsureDescriptionTicker()
+	{
+		Scheduler.VerifyOwnThread();
+		descriptionTicker ??= Scheduler.CreateTimer(
+			() => { _ = OnStatusTick(); },
+			DescriptionTickInterval,
+			true);
+	}
+
+	/// <summary>Drives both status surfaces from one timer: the description every tick, the
+	/// avatar far less often. Each avatar update is a full file transfer plus a broadcast to
+	/// every client, so it is deliberately slow - frame-by-frame animation would flood the
+	/// server and make clients flicker as they re-fetch the image.</summary>
+	private async Task OnStatusTick()
+	{
+		await UpdateBotStatusInternal();
+
+		if (!config.GenerateStatusAvatar || isClosed || QuizMode || !playManager.IsPlaying)
+			return;
+
+		var now = System.Environment.TickCount64;
+		if (now - lastAvatarRefresh < AvatarRefreshIntervalMs)
+			return;
+
+		// Only redraw when the bar would visibly move, otherwise an identical image is uploaded.
+		var progress = AvatarProgress(true);
+		if (progress is null)
+			return;
+		var step = (int)(progress.Value * ProgressSteps);
+		if (step == lastProgressStep)
+			return;
+
+		lastProgressStep = step;
+		lastAvatarRefresh = now;
+		await GenerateStatusImageInternal(true, playManager.CurrentPlayData);
 	}
 
 	public Task GenerateStatusImage(bool playing, PlayInfoEventArgs? startEvent)
@@ -453,77 +551,45 @@ public sealed class Bot
 		if (!config.GenerateStatusAvatar || isClosed)
 			return;
 
-		static Stream? GetRandomFile(string? basePath, string prefix)
-		{
-			try
-			{
-				if (string.IsNullOrEmpty(basePath))
-					return null;
-				var avatarPath = new DirectoryInfo(Path.Combine(basePath, BotPaths.Avatars));
-				if (!avatarPath.Exists)
-					return null;
-				var avatars = avatarPath.EnumerateFiles(prefix).ToArray();
-				if (avatars.Length == 0)
-					return null;
-				var pickedAvatar = Tools.PickRandom(avatars);
-				return pickedAvatar.Open(FileMode.Open, FileAccess.Read, FileShare.Read);
-			}
-			catch (Exception ex)
-			{
-				Log.Warn(ex, "Failed to load local avatar");
-				return null;
-			}
-		}
-
+		// Supersede an upload that is still running: on a fast skip only the newest avatar
+		// should reach the server, and the cover lookup behind it can take a moment.
+		var previous = avatarRequest;
 		using var cts = new CancellationTokenSource();
-		avatarRequest?.Cancel();
 		avatarRequest = cts;
+		previous?.Cancel();
 
-		Stream? setStream = null;
-		if (playing)
+		try
 		{
-			if (startEvent != null && !QuizMode)
-			{
-				try
-				{
-					await resourceResolver.GetThumbnail(startEvent.PlayResource,
-						async (thumbStream, ct) =>
-							setStream = (await ImageUtil.ResizeImageSave(thumbStream, ct)).Stream, cts.Token);
-				}
-				catch (AudioBotException ex) { Log.Debug(ex, "Failed to fetch thumbnail image"); }
-				catch (OperationCanceledException) { return; }
-			}
+			var resource = startEvent?.ResourceData;
+			await using var image = await NowPlayingCard.RenderAsync(
+				resource?.ResourceTitle,
+				resource?.AudioType,
+				resource?.ResourceId,
+				playing && !QuizMode,
+				AvatarProgress(playing),
+				cts.Token);
 
-			setStream ??= GetRandomFile(config.LocalConfigDir, "play*");
-		}
-		else
-		{
-			setStream ??= GetRandomFile(config.LocalConfigDir, "sleep*");
-			setStream ??= Util.GetEmbeddedFile("TS3AudioBot.Assets.SleepingKitty.png");
-		}
+			// A newer request may have arrived while the cover was being fetched.
+			if (cts.IsCancellationRequested || avatarRequest != cts)
+				return;
 
-		if (setStream != null)
-		{
-			try
-			{
-				using (setStream)
-				{
-					var result = await ts3FullClient.UploadAvatar(setStream, cts.Token);
-					result.UnwrapToLog(Log);
-				}
-			}
-			catch (Exception ex)
-			{
-				Log.Warn(ex, "Could not change avatar");
-			}
-		}
-		else
-		{
-			var result = await ts3FullClient.DeleteAvatar();
+			var size = image.Length;
+			var watch = System.Diagnostics.Stopwatch.StartNew();
+			var result = await ts3FullClient.UploadAvatar(image, cts.Token);
+			watch.Stop();
+			Log.Debug("Avatar upload: {0} bytes in {1} ms", size, watch.ElapsedMilliseconds);
 			result.UnwrapToLog(Log);
 		}
-
-		if (avatarRequest == cts) avatarRequest = null;
+		catch (OperationCanceledException) { return; }
+		catch (Exception ex)
+		{
+			Log.Warn(ex, "Could not change avatar");
+		}
+		finally
+		{
+			if (avatarRequest == cts)
+				avatarRequest = null;
+		}
 	}
 
 	#endregion
@@ -627,6 +693,19 @@ public sealed class Bot
 	}
 
 	private void DisableIdleTickWorker() => idleTickWorker.Disable();
+
+	/// <summary>Starts the avatar refresh budget over for a new track.</summary>
+	private void ResetAvatarRefresh()
+	{
+		lastProgressStep = -1;
+		lastAvatarRefresh = System.Environment.TickCount64;
+	}
+
+	private void DisableDescriptionTicker()
+	{
+		descriptionTicker?.Disable();
+		descriptionTicker = null;
+	}
 
 	#endregion
 

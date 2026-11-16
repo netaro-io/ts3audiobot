@@ -1540,6 +1540,8 @@ public static class MainCommands
 				var tmb = new StringBuilder();
 				tmb.Append(x.Paused ? "⏸ " : "► ");
 				tmb.AppendFormat("[url={0}]{1}[/url]", x.Link, x.Title);
+				tmb.Append(' ');
+				tmb.Append(ProgressBar(x.Position, x.Length));
 				tmb.Append(" [");
 				tmb.Append(x.Length.TotalHours >= 1 || x.Position.TotalHours >= 1
 					? $"{x.Position:hh\\:mm\\:ss}/{x.Length:hh\\:mm\\:ss}"
@@ -1550,8 +1552,21 @@ public static class MainCommands
 		);
 	}
 
+	private const int ProgressBarWidth = 20;
+
+	/// <summary>Renders the playback position as a text bar. Returns nothing for a stream of
+	/// unknown length, where a bar would be meaningless.</summary>
+	private static string ProgressBar(TimeSpan position, TimeSpan length)
+	{
+		if (length <= TimeSpan.Zero)
+			return "";
+		var ratio = Math.Clamp(position.TotalSeconds / length.TotalSeconds, 0d, 1d);
+		var filled = (int)Math.Round(ratio * ProgressBarWidth);
+		return string.Concat("[", new string('█', filled), new string('─', ProgressBarWidth - filled), "]");
+	}
+
 	[Command("stop")]
-	public static void CommandStop(PlayManager playManager) => playManager.Stop();
+	public static Task CommandStop(PlayManager playManager) => playManager.Stop();
 
 	[Command("subscribe")]
 	public static void CommandSubscribe(IVoiceTarget targetManager, ClientCall invoker)
@@ -1699,6 +1714,98 @@ public static class MainCommands
 
 	[Command("version")]
 	public static JsonValue<BuildData> CommandVersion() => new(SystemData.AssemblyData, d => d.ToLongString());
+
+	private const int ToneLimitDb = 12;
+	private const int MaxCrossfadeSeconds = 20;
+
+	[Command("bass")]
+	public static string CommandBass(Player player) => DescribeTone("Bass", player.FfmpegProducer.BassDb);
+
+	[Command("bass")]
+	public static async Task<string> CommandBass(Player player, ConfBot config, string value)
+	{
+		var next = ParseTone(value, player.FfmpegProducer.BassDb);
+		config.Audio.Bass.Value = next;
+		player.FfmpegProducer.BassDb = next;
+		await RestartTone(player);
+		config.SaveWhenExists().UnwrapThrow();
+		return DescribeTone("Bass", next);
+	}
+
+	[Command("treble")]
+	public static string CommandTreble(Player player) => DescribeTone("Treble", player.FfmpegProducer.TrebleDb);
+
+	[Command("treble")]
+	public static async Task<string> CommandTreble(Player player, ConfBot config, string value)
+	{
+		var next = ParseTone(value, player.FfmpegProducer.TrebleDb);
+		config.Audio.Treble.Value = next;
+		player.FfmpegProducer.TrebleDb = next;
+		await RestartTone(player);
+		config.SaveWhenExists().UnwrapThrow();
+		return DescribeTone("Treble", next);
+	}
+
+	[Command("crossfade")]
+	public static string CommandCrossfade(ConfBot config)
+	{
+		var seconds = config.Audio.Crossfade.Value;
+		return seconds <= 0
+			? "Crossfade is off. Set it with !crossfade <0-" + MaxCrossfadeSeconds + ">."
+			: "Crossfade " + seconds + "s. Short tracks use less so the fade cannot swallow them.";
+	}
+
+	[Command("crossfade")]
+	public static string CommandCrossfadeSet(ConfBot config, int seconds)
+	{
+		if (seconds < 0 || seconds > MaxCrossfadeSeconds)
+			throw new CommandException("Crossfade accepts 0 to " + MaxCrossfadeSeconds + " seconds, 0 turns it off.", CommandExceptionReason.CommandError);
+		config.Audio.Crossfade.Value = seconds;
+		config.SaveWhenExists().UnwrapThrow();
+		return seconds == 0 ? "Crossfade off" : "Crossfade " + seconds + "s";
+	}
+
+	private static string DescribeTone(string label, int value)
+		=> value == 0
+			? label + " flat (0 dB)"
+			: label + " " + value.ToString("+0;-0", CultureInfo.InvariantCulture) + " dB";
+
+	private static int ParseTone(string value, int current)
+	{
+		value = value.Trim();
+		var usage = "Use a value from -" + ToneLimitDb + " to " + ToneLimitDb + ", or a relative +N / -N.";
+
+		if (string.Equals(value, "flat", StringComparison.OrdinalIgnoreCase) || string.Equals(value, "reset", StringComparison.OrdinalIgnoreCase))
+			return 0;
+
+		int next;
+		// A leading '+' means relative; a leading '-' is ambiguous, so it is read as absolute,
+		// which is also what "-6" means to anyone typing it.
+		if (value.StartsWith('+'))
+		{
+			if (!int.TryParse(value[1..], NumberStyles.Integer, CultureInfo.InvariantCulture, out var delta))
+				throw new CommandException(usage, CommandExceptionReason.CommandError);
+			next = current + delta;
+		}
+		else if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out next))
+		{
+			throw new CommandException(usage, CommandExceptionReason.CommandError);
+		}
+
+		if (next < -ToneLimitDb || next > ToneLimitDb)
+			throw new CommandException("Tone is limited to -" + ToneLimitDb + " to " + ToneLimitDb + " dB.", CommandExceptionReason.CommandError);
+		return next;
+	}
+
+	/// <summary>Reapplies the filter chain by restarting the decoder at the current position.
+	/// Goes through <see cref="Player.Seek"/> so the change is faded and the read-ahead buffer
+	/// is dropped - seeking the decoder directly left stale audio queued and clicked.</summary>
+	private static Task RestartTone(Player player)
+	{
+		if (player.CurrentPlayerSource is null)
+			return Task.CompletedTask;
+		return player.Seek(player.Position ?? TimeSpan.Zero);
+	}
 
 	[Command("volume")]
 	public static JsonValue<float> CommandVolume(Player playerConnection)

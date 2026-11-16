@@ -60,6 +60,7 @@ public sealed class EncoderPipe : IAudioPipe, IDisposable
 		case Codec.OpusMusic:
 			SampleInfo = SampleInfo.OpusMusic;
 			opusEncoder = OpusEncoder.Create(SampleInfo, Application.Audio);
+			opusEncoder.ConfigureForMusic();
 			Bitrate = 8192 * 4;
 			break;
 

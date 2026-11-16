@@ -34,11 +34,21 @@ public sealed partial class FfmpegProducer : IPlayerSource, IDisposable
 	private static partial Regex IcyMetadataMacher { get; }
 
 	private const string PreLinkConf = "-hide_banner -nostats -threads 1 -i \"";
+	private string OutputArgs()
+	{
+		var bass = Math.Clamp(BassDb, -12, 12);
+		var treble = Math.Clamp(TrebleDb, -12, 12);
+		var filter = string.Create(CultureInfo.InvariantCulture, $"bass=g={bass}:f=110:w=0.5,treble=g={treble}:f=6000:w=0.5,alimiter=limit=0.95:level=disabled");
+		return $"-af \"{filter}\" -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
+	}
+
 	private const string PostLinkConf = "\" -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 	private const string LinkConfIcy = "-hide_banner -nostats -threads 1 -i pipe:0 -ac 2 -ar 48000 -f s16le -acodec pcm_s16le pipe:1";
 	private static readonly TimeSpan retryOnDropBeforeEnd = TimeSpan.FromSeconds(10);
 
 	private readonly ConfToolsFfmpeg config;
+	public int BassDb { get; set; }
+	public int TrebleDb { get; set; }
 
 	public event EventHandler? OnSongEnd;
 	public event EventHandler<SongInfoChanged>? OnSongUpdated;
@@ -206,11 +216,11 @@ public sealed partial class FfmpegProducer : IPlayerSource, IDisposable
 		if (offset > TimeSpan.Zero)
 		{
 			var seek = string.Format(CultureInfo.InvariantCulture, @"-ss {0:hh\:mm\:ss\.fff}", offset);
-			arguments = string.Concat(seek, " ", PreLinkConf, url, PostLinkConf, " ", seek);
+			arguments = string.Concat(seek, " ", PreLinkConf, url, "\" ", OutputArgs(), " ", seek);
 		}
 		else
 		{
-			arguments = string.Concat(PreLinkConf, url, PostLinkConf);
+			arguments = string.Concat(PreLinkConf, url, "\" ", OutputArgs());
 		}
 
 		var newInstance = new FfmpegInstance(
@@ -256,7 +266,7 @@ public sealed partial class FfmpegProducer : IPlayerSource, IDisposable
 				Name = $"IcyStreamReader[{id}]",
 			}.Start();
 
-			return StartFfmpegProcessInternal(newInstance, LinkConfIcy);
+			return StartFfmpegProcessInternal(newInstance, "-hide_banner -nostats -threads 1 -i pipe:0 " + OutputArgs());
 		}
 		catch (Exception ex)
 		{

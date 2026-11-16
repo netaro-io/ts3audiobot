@@ -17,8 +17,16 @@
 		<StartupObject>TS3AudioBot.Setup</StartupObject>
 
 		<!-- GC Config -->
-		<ServerGarbageCollection>true</ServerGarbageCollection>
+		<!-- Workstation GC: the bot is latency-bound, not throughput-bound. Server GC keeps one
+		     heap per core (4 here) and holds far more memory for a process that idles near 0 %
+		     CPU; its longer stop-the-world pauses are also exactly what an audio send thread
+		     cannot afford. Concurrent GC keeps collections off the critical path. -->
+		<ServerGarbageCollection>false</ServerGarbageCollection>
 		<ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+		<!-- Release memory back to the OS instead of holding freed segments. -->
+		<RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+		<!-- InvariantGlobalization stays off on purpose: it would make string.Normalize throw,
+		     and the cover matcher relies on it to fold umlauts and compare non-latin titles. -->
 		<!-- SourceLink -->
 		<RepositoryUrl>https://github.com/Splamy/TS3AudioBot.git</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
@@ -47,6 +55,7 @@
 		<PackageReference Include="Nett" Version="0.15.0" />
 		<PackageReference Include="PlaylistsNET" Version="1.4.1" />
 		<PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+		<PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.1.4" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -71,7 +80,7 @@
 	</ItemGroup>
 
     <ItemGroup>
-        <InternalsVisibleTo Include="TS3AudioBot.Tests"/>
+        <InternalsVisibleTo Include="TS3AudioBot.Tests" />
     </ItemGroup>
     
 	<ItemGroup>

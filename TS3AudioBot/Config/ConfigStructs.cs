@@ -220,9 +220,10 @@ public class ConfAudio : ConfigTable
 		"When the current volume already is between min and max nothing will happen.\n" +
 		"To completely or partially disable this feature, set min to 0 and/or max to 100.");
 	public ConfigValue<float> MaxUserVolume { get; } = new("max_user_volume", 100, "The maximum volume a normal user can request. Only user with the 'ts3ab.admin.volume' permission can request higher volumes.");
-	public ConfigValue<int> Bitrate { get; } = new("bitrate", 48, "Specifies the bitrate (in kbps) for sending audio.\n" +
-		"Values between 8 and 98 are supported, more or less can work but without guarantees.\n" +
-		"Reference values: 16 - very poor (~3KiB/s), 24 - poor (~4KiB/s), 32 - okay (~5KiB/s), 48 - good (~7KiB/s), 64 - very good (~9KiB/s), 96 - deluxe (~13KiB/s)");
+	public ConfigValue<int> Bitrate { get; } = new("bitrate", 96, "Opus Music bitrate in kbps. Values above 96 are clamped: a 20 ms frame must stay under the voice packet limit.");
+	public ConfigValue<int> Bass { get; } = new("bass", 0, "Bass shelf in dB, from -12 to 12. Applied by ffmpeg on the next song.");
+	public ConfigValue<int> Treble { get; } = new("treble", 0, "Treble shelf in dB, from -12 to 12. Applied by ffmpeg on the next song.");
+	public ConfigValue<int> Crossfade { get; } = new("crossfade", 12, "Seconds the next song overlaps the end of the current one. 0 turns the overlap off.");
 	public ConfigValue<string> SendMode { get; } = new("send_mode", "voice", "How the bot should play music. Options are:\n" +
 		" - whisper : Whispers to the channel where the request came from. Other users can join with '!subscribe'.\n" +
 		" - voice : Sends via normal voice to the current channel. '!subscribe' will not work in this mode.\n" +

@@ -22,7 +22,8 @@ public class PassiveMergePipe : IAudioPassiveProducer, ICollection<IAudioPassive
 	private readonly List<IAudioPassiveProducer> producerList = [];
 	private readonly Lock listLock = new();
 	private bool changed;
-	private readonly int[] accBuffer = new int[4096];
+	private int[] accBuffer = [];
+	private byte[] mixScratch = [];
 
 	public int Count => safeProducerList.Length;
 	public bool IsReadOnly => false;
@@ -87,25 +88,48 @@ public class PassiveMergePipe : IAudioPassiveProducer, ICollection<IAudioPassive
 		if (safeProducerList.Length == 1)
 			return safeProducerList[0].Read(data, out _);
 
-		int maxReadLength = Math.Min(accBuffer.Length, data.Length);
-		Array.Clear(accBuffer, 0, maxReadLength);
+		// Every producer reads into its own scratch span. Reading them all into `data` and
+		// summing in place would add the previous producer's tail a second time whenever a
+		// producer returns fewer bytes than the one before it - which is exactly what happens
+		// while a crossfade is still filling up, and it was audible as a click.
+		int maxReadLength = data.Length - (data.Length % 4);
+		if (maxReadLength <= 0)
+			return 0;
 
-		var pcmBuffer = MemoryMarshal.Cast<byte, short>(data);
+		if (mixScratch.Length < maxReadLength)
+			mixScratch = new byte[maxReadLength];
+		if (accBuffer.Length < maxReadLength / 2)
+			accBuffer = new int[maxReadLength / 2];
+
+		var acc = accBuffer.AsSpan(0, maxReadLength / 2);
+		acc.Clear();
+
+		var scratch = mixScratch.AsSpan(0, maxReadLength);
+		var scratchPcm = MemoryMarshal.Cast<byte, short>(scratch);
 		int read = 0;
 
 		foreach (var producer in safeProducerList)
 		{
-			int ppread = producer.Read(data[..maxReadLength], out meta);
-			if (ppread == 0)
+			int ppread = producer.Read(scratch, out var producerMeta);
+			if (ppread <= 0)
+				continue;
+			ppread -= ppread % 2;
+			if (ppread <= 0)
 				continue;
 
+			meta ??= producerMeta;
 			read = Math.Max(read, ppread);
-			for (int i = 0; i < ppread / 2; i++)
-				accBuffer[i] += pcmBuffer[i];
+			var samples = scratchPcm[..(ppread / 2)];
+			for (int i = 0; i < samples.Length; i++)
+				acc[i] += samples[i];
 		}
 
+		if (read == 0)
+			return 0;
+
+		var pcmBuffer = MemoryMarshal.Cast<byte, short>(data);
 		for (int i = 0; i < read / 2; i++)
-			pcmBuffer[i] = (short)Math.Max(Math.Min(accBuffer[i], short.MaxValue), short.MinValue);
+			pcmBuffer[i] = (short)Math.Clamp(acc[i], short.MinValue, short.MaxValue);
 
 		return read;
 	}
