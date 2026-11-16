@@ -138,6 +138,21 @@ internal static partial class NowPlayingCard
 		return Card(cover, track, progress);
 	}
 
+	/// <summary>Liefert nur das Cover des Titels, ohne die Karte darum.
+	///
+	/// Für das Kundenpanel: dort steht der Titel schon da, gebraucht wird das Bild.
+	/// Nutzt denselben Cache und dieselbe Trefferprüfung wie die Avatar-Karte, damit
+	/// Panel und Clientfenster nicht verschiedene Cover zeigen. Findet sich keins,
+	/// kommt der generierte Platzhalter - so bleibt immer ein Bild übrig, und der
+	/// Aufrufer braucht keinen Sonderfall.</summary>
+	public static async Task<MemoryStream> CoverAsync(string? raw, string? resourceId, CancellationToken cancellationToken)
+	{
+		var track = Split(raw);
+		using var cover = await LoadCoverAsync(track, resourceId, cancellationToken) ?? Poster(track);
+
+		return Save(cover);
+	}
+
 	/// <summary>
 	/// Resolves cover art, trying the cheapest and most reliable source first. Results are
 	/// cached by track, including misses: the chain is up to six HTTP calls, and replaying it

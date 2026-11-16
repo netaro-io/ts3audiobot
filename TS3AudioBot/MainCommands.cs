@@ -371,6 +371,29 @@ public static class MainCommands
 		return CommandManager.GetTree(commandManager.RootGroup);
 	}
 
+	/// <summary>Cover des laufenden Titels als Bild.
+	///
+	/// Eigener Befehl neben "data song cover get": der läuft über GetThumbnail und
+	/// braucht einen IThumbnailResolver zum AudioType - den gibt es hier für Dateien
+	/// und Radiostreams nicht. Dieser Weg nutzt die Cover-Suche der Avatar-Karte, die
+	/// mit einem Titelstring arbeitet und deshalb auch bei Radio greift.</summary>
+	[Command("data song art get", "_undocumented")]
+	public static DataStream CommandDataSongArt(PlayManager playManager) =>
+		new(async response =>
+		{
+			var cur = playManager.CurrentPlayData;
+			if (cur is null)
+				throw Error.LocalStr(strings.info_currently_not_playing);
+
+			using var image = await NowPlayingCard.CoverAsync(
+				cur.ResourceData?.ResourceTitle,
+				cur.ResourceData?.ResourceId,
+				CancellationToken.None);
+
+			response.ContentType = "image/jpeg";
+			await image.CopyToAsync(response.Body);
+		});
+
 	[Command("data song cover get", "_undocumented")]
 	public static DataStream CommandData(ResolveContext resourceFactory, PlayManager playManager) =>
 		new(async response =>
