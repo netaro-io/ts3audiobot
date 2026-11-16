@@ -29,6 +29,9 @@ public sealed class Player : IDisposable
 	private static readonly TimeSpan FadeOutHard = TimeSpan.FromMilliseconds(45);
 	private static readonly TimeSpan FadeInHard = TimeSpan.FromMilliseconds(45);
 	private static readonly TimeSpan FadeOutStop = TimeSpan.FromMilliseconds(90);
+	/// <summary>Stille nach dem Fade. Deckt den Opus-Overlap und den Anlauf des
+	/// Client-Puffers ab, ohne dass sich das Stoppen träge anfühlt.</summary>
+	private static readonly TimeSpan SilenceTail = TimeSpan.FromMilliseconds(120);
 	private static readonly TimeSpan MinFade = TimeSpan.FromMilliseconds(200);
 	/// <summary>Audio the incoming track must have buffered before the fade starts: 100 ms.</summary>
 	private const int PrerollBytes = 48000 / 10 * 2 * 2;
@@ -275,12 +278,40 @@ public sealed class Player : IDisposable
 		if (fading != null)
 		{
 			fading.RampTo(0f, FadeOutStop, false);
-			await WaitForRamp(fading, FadeOutStop).ConfigureAwait(false);
+			await WaitForRamp(fading, FadeOutStop);
 		}
 		DropIncoming(false);
+		// Stille nachschieben, bevor der Strom endet. Ohne sie hat der letzte
+		// Opus-Frame keinen Nachfolger, mit dem der Decoder ihn auflösen kann,
+		// und der Jitterpuffer des Clients läuft ohne Vorwarnung leer - der
+		// Client extrapoliert den Abriss, und genau das knackt.
+		//
+		// Die Stille kommt in die MergePipe, nicht an PlayerSink: der hängt
+		// hinter dem Encoder, dort wären PCM-Nullen ein kaputtes Opus-Paket.
+		// Die Quelle wird erst danach abgebaut - ffmpeg zu töten, während der
+		// Tick-Thread noch liest, war die zweite Hälfte desselben Problems.
+		await SendSilenceTail();
 		DetachLive();
 		if (MergePipe.Count <= 1)
 			TimePipe.Paused = true;
+	}
+
+	/// <summary>Schiebt nach dem Fade echte Stille nach, damit der Paketstrom
+	/// ausklingt statt abzureißen. Die Dauer deckt den Opus-Overlap und den
+	/// Anlauf des Client-Puffers ab - mehr würde das Stoppen nur träge machen.</summary>
+	private async Task SendSilenceTail()
+	{
+		var silence = new SilenceProducer();
+		MergePipe.Add(silence);
+
+		try
+		{
+			await Task.Delay(SilenceTail);
+		}
+		finally
+		{
+			MergePipe.Remove(silence);
+		}
 	}
 
 	/// <summary>Synchronous teardown for <see cref="Dispose"/>, where awaiting is not possible.
@@ -642,5 +673,21 @@ internal sealed class PullBuffer : IAudioPassiveProducer, IDisposable
 			Volatile.Write(ref writePos, write + take);
 			offset += take;
 		}
+	}
+}
+
+/// <summary>Liefert Stille, solange sie gelesen wird.
+///
+/// Gebraucht beim Stoppen: der Paketstrom soll auf echter Stille auslaufen statt
+/// mitten in der Welle abzureißen. Ein Producer in der MergePipe ist der
+/// einzige Weg dorthin, der durch Encoder und Timer läuft wie normaler Ton.</summary>
+internal sealed class SilenceProducer : IAudioPassiveProducer
+{
+	public int Read(Span<byte> data, out Meta? meta)
+	{
+		meta = null;
+		data.Clear();
+
+		return data.Length;
 	}
 }
