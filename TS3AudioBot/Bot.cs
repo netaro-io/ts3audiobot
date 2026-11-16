@@ -167,6 +167,11 @@ public sealed class Bot
 		playManager.AfterResourceStarted += (s, e) => UpdateBotStatus();
 		playManager.PlaybackStopped += (s, e) => UpdateBotStatus();
 		playManager.OnResourceUpdated += (s, e) => UpdateBotStatus();
+		// Das Bild gehoert mit erneuert: bei einem Radiosender wechselt der Titel
+		// mitten in der Wiedergabe, und ohne das blieb das Cover auf dem
+		// Sendernamen stehen. Der Fortschrittsbalken wird dabei nicht
+		// zurueckgesetzt - der Sender laeuft weiter, nur das Stueck ist neu.
+		playManager.OnResourceUpdated += (s, e) => GenerateStatusImage(true, e);
 		// Log our resource in the history
 		if (Injector.TryGet<HistoryManager>(out var historyManager))
 			playManager.AfterResourceStarted += (s, e) =>
